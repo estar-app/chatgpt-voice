@@ -28,17 +28,19 @@ import * as Tooltip from '@radix-ui/react-tooltip';
 import * as Dialog from '@radix-ui/react-dialog';
 import * as Slider from '@radix-ui/react-slider';
 import * as Select from '@radix-ui/react-select';
-import { isDesktop, isMobile, isSafari } from 'react-device-detect';
+import { isDesktop, isMobile } from 'react-device-detect';
 
 import Button from './design_system/Button';
 import SyntaxHighlighter from './design_system/SyntaxHighlighter';
-import Message from './Message';
-import * as Storage from './storage';
+import Message from './design_system/Message';
+import API from './lib/api';
+import Config from './lib/config';
+import * as Storage from './lib/storage';
 import usePrevious from './hooks/usePrevious';
+import useVoices from './hooks/useVoices';
 
 interface CreateChatGPTMessageResponse {
   answer: string;
-  conversationId: string;
   messageId: string;
 }
 
@@ -50,10 +52,6 @@ interface Message {
 interface VoiceMappings {
   [group: string]: SpeechSynthesisVoice[];
 }
-
-// Disable local server setup instruction because we have a
-// backend server running. This might change in the future.
-const IS_LOCAL_SETUP_REQUIRED = false;
 
 const savedData = Storage.load();
 
@@ -89,11 +87,11 @@ function App() {
   });
   const [isModalVisible, setIsModalVisible] = useState(false);
   const [isTooltipVisible, setIsTooltipVisible] = useState(
-    IS_LOCAL_SETUP_REQUIRED,
+    Config.IS_LOCAL_SETUP_REQUIRED,
   );
-  const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
+  const { voices, defaultVoice } = useVoices();
   const abortRef = useRef<AbortController | null>(null);
-  const conversationRef = useRef({ id: '', currentMessageId: '' });
+  const conversationRef = useRef({ currentMessageId: '' });
   const bottomDivRef = useRef<HTMLDivElement>(null);
 
   const availableVoices = useMemo(() => {
@@ -153,7 +151,7 @@ function App() {
   const resetConversation = () => {
     setIsProcessing(false);
     setMessages(initialMessages);
-    conversationRef.current = { id: '', currentMessageId: '' };
+    conversationRef.current = { currentMessageId: '' };
 
     window.speechSynthesis.cancel();
     SpeechRecognition.abortListening();
@@ -184,58 +182,23 @@ function App() {
     bottomDivRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages.length]);
 
-  // Display voices when they become available
   useEffect(() => {
-    const updateVoiceSettings = () => {
-      const newVoices = window.speechSynthesis.getVoices();
-      const defaultVoice = newVoices.find(
-        (voice) => voice.default && voice.lang.startsWith('en-'),
-      );
-      setVoices(newVoices);
-      setSettings((oldSettings) => {
-        // If a preferred voice is already set, keep it
-        if (oldSettings.voiceURI) {
-          return oldSettings;
-        }
-        return {
-          ...oldSettings,
-          voiceURI: defaultVoice ? defaultVoice.voiceURI : '',
-        };
-      });
-      if (defaultVoice) {
-        defaultSettingsRef.current.voiceURI = defaultVoice.voiceURI;
-      }
-    };
-
-    // Safari doesn't support `voiceschanged` event, so we have to
-    // periodically check if voices are loaded.
-    // So is any mobile browser on iOS.
-    if (isSafari || isMobile) {
-      let interval = setInterval(() => {
-        const newVoices = window.speechSynthesis.getVoices();
-        if (newVoices.length > 0) {
-          clearInterval(interval);
-          updateVoiceSettings();
-        }
-      }, 100);
-      // Stop checking after 10 seconds
-      setTimeout(() => clearInterval(interval), 10_000);
-
-      return () => clearInterval(interval);
+    if (!defaultVoice) {
+      return;
     }
 
-    window.speechSynthesis.addEventListener(
-      'voiceschanged',
-      updateVoiceSettings,
-    );
-
-    return () => {
-      window.speechSynthesis.removeEventListener(
-        'voiceschanged',
-        updateVoiceSettings,
-      );
-    };
-  }, []);
+    defaultSettingsRef.current.voiceURI = defaultVoice.voiceURI;
+    setSettings((oldSettings) => {
+      // If a preferred voice is already set, keep it
+      if (oldSettings.voiceURI) {
+        return oldSettings;
+      }
+      return {
+        ...oldSettings,
+        voiceURI: defaultVoice.voiceURI,
+      };
+    });
+  }, [defaultVoice]);
 
   useEffect(() => {
     // Only run effect if finalTranscript change from undefined or ''
@@ -250,25 +213,18 @@ function App() {
     ]);
     setIsProcessing(true);
 
-    abortRef.current = new AbortController();
-    const host = IS_LOCAL_SETUP_REQUIRED
+    const host = Config.IS_LOCAL_SETUP_REQUIRED
       ? `${settings.host}:${settings.port}`
-      : 'https://sonng-chatgpt.uksouth.cloudapp.azure.com';
-    fetch(`${host}/chatgpt/messages`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        text: finalTranscript,
-        conversationId: conversationRef.current.id || undefined,
-        parentMessageId: conversationRef.current.currentMessageId || undefined,
-      }),
-      signal: abortRef.current.signal,
-    })
+      : Config.API_HOST;
+    const { response, abortController } = API.sendMessage(host, {
+      text: finalTranscript,
+      parentMessageId: conversationRef.current.currentMessageId || undefined,
+    });
+    abortRef.current = abortController;
+
+    response
       .then((res) => res.json())
       .then((res: CreateChatGPTMessageResponse) => {
-        conversationRef.current.id = res.conversationId;
         conversationRef.current.currentMessageId = res.messageId;
         setMessages((oldMessages) => [
           ...oldMessages,
@@ -280,8 +236,13 @@ function App() {
         console.warn(err);
         let response: string;
 
+        // Ignore aborted request
+        if (abortController.signal.aborted) {
+          return;
+        }
+
         // Connection refused
-        if (err instanceof TypeError && IS_LOCAL_SETUP_REQUIRED) {
+        if (err instanceof TypeError && Config.IS_LOCAL_SETUP_REQUIRED) {
           response =
             'Local server needs to be set up first. Click on the Settings button to see how.';
           setIsTooltipVisible(true);
@@ -451,21 +412,21 @@ function App() {
           <Dialog.Overlay className="bg-dark/75 fixed inset-0 animate-fade-in" />
           <Dialog.Content
             className={`bg-light border border-dark rounded-lg shadow-solid fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-5/6 max-w-md max-h-screen p-6 animate-rise-up focus:outline-none overflow-y-auto ${
-              IS_LOCAL_SETUP_REQUIRED ? 'lg:max-w-5xl' : ''
+              Config.IS_LOCAL_SETUP_REQUIRED ? 'lg:max-w-5xl' : ''
             }`}
           >
             <Dialog.Title className="font-medium text-xl mb-4">
               Settings
             </Dialog.Title>
 
-            {IS_LOCAL_SETUP_REQUIRED && (
+            {Config.IS_LOCAL_SETUP_REQUIRED && (
               <Dialog.Description>
                 Set up local server on Desktop in 3 easy steps.
               </Dialog.Description>
             )}
 
             <main className="lg:flex lg:gap-x-12">
-              {IS_LOCAL_SETUP_REQUIRED && (
+              {Config.IS_LOCAL_SETUP_REQUIRED && (
                 <div>
                   <h3 className="text-lg font-medium mt-3">Step 1</h3>
                   <p>
@@ -506,7 +467,7 @@ function App() {
               )}
 
               <div className="lg:w-full">
-                {IS_LOCAL_SETUP_REQUIRED && isDesktop && (
+                {Config.IS_LOCAL_SETUP_REQUIRED && isDesktop && (
                   <div className="mb-4">
                     <h3 className="text-lg font-medium mt-3">Server</h3>
 
